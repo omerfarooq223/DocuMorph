@@ -8,9 +8,15 @@
     "server": "tsx watch server/index.ts",
     "client": "npm --prefix client run dev",
     "build": "tsc && npm --prefix client run build",
-    "test": "tsx tests/extraction.test.ts && tsx tests/e2e.test.ts",
+    "test": "tsx tests/extraction.test.ts && tsx tests/e2e.test.ts && tsx tests/phase2-reliability.test.ts && tsx tests/provenance-transform.test.ts",
     "test:unit": "tsx tests/extraction.test.ts",
-    "test:e2e": "tsx tests/e2e.test.ts"
+    "test:e2e": "tsx tests/e2e.test.ts",
+    "test:reliability": "tsx tests/phase2-reliability.test.ts",
+    "test:provenance": "tsx tests/provenance-transform.test.ts",
+    "test:corpus": "tsx tests/utils/synthetic-stress-builder.ts",
+    "test:eval": "tsx tests/evaluation-runner.ts",
+    "groundtruth": "tsx tests/utils/groundtruth-tool.ts",
+    "benchmark": "tsx tests/benchmark.test.ts"
   },
   "devDependencies": {
     "@types/cors": "^2.8.19",
