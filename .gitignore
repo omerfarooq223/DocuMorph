@@ -36,3 +36,21 @@ temp
 # Real Corpus Generated Drafts & Actual Extractions (Privacy Safeguard)
 tests/corpus/real/**/*.actual.json
 tests/corpus/real/**/*.expected.draft.json
+
+# Generated synthetic corpus (rebuild with: npm run test:corpus)
+tests/corpus/synthetic/
+
+# Real-world evaluation corpus (kept locally only)
+tests/corpus/real/
+
+# Large independent benchmark corpus & outputs
+phase5_real_independent/
+
+# Tesseract OCR model (auto-downloaded at runtime)
+eng.traineddata
+
+# Scratch files
+scratch/
+
+# Generated benchmark reports & result dumps
+reports/
