@@ -102,7 +102,7 @@ export const SchemaEditor: React.FC<SchemaEditorProps> = ({
       {isOpen && (
         <div className="schema-accordion-body">
           <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)', marginBottom: 12 }}>
-            Define a custom JSON template to enforce the structure of the extracted data. Missing fields will be populated with <code>null</code> or empty arrays without hallucination.
+            Define a custom JSON template to enforce the structure of the extracted data. Grounded extraction — missing fields will be populated with <code>null</code> or empty arrays.
           </p>
 
           <div className="schema-templates-bar">
