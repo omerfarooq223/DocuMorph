@@ -16,6 +16,13 @@ export const config = {
   // OCR threshold: if a page has fewer than this many characters, flag as candidate for OCR
   scannedTextDensityThreshold: 50,
   
+  // Resource Safeguards & Limits
+  maxFileSizeMb: parseInt(process.env.MAX_FILE_SIZE_MB || '50', 10),
+  maxPdfPages: parseInt(process.env.MAX_PDF_PAGES || '500', 10),
+  maxOcrPages: parseInt(process.env.MAX_OCR_PAGES || '50', 10),
+  maxRenderPixels: parseInt(process.env.MAX_RENDER_PIXELS || '25000000', 10), // e.g. 5000x5000
+  ocrTimeoutMs: parseInt(process.env.OCR_TIMEOUT_MS || '30000', 10),
+
   // AI Defaults (Optional)
   ollama: {
     baseUrl: process.env.OLLAMA_BASE_URL || 'http://localhost:11434',
@@ -30,3 +37,4 @@ export const config = {
     model: process.env.OPENAI_MODEL || 'gpt-4o-mini',
   },
 };
+

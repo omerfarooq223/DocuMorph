@@ -1,4 +1,5 @@
 import { createWorker } from 'tesseract.js';
+import { config } from '../config.js';
 
 export interface OCRResult {
   text: string;
@@ -17,11 +18,31 @@ export class TesseractOCRService implements IOCRService {
   public readonly name = 'Tesseract.js';
   private worker: any = null;
   private isInitializing: boolean = false;
+  private isBusy: boolean = false;
+  private queue: Array<() => void> = [];
+
+  private async acquireLock(): Promise<void> {
+    if (!this.isBusy) {
+      this.isBusy = true;
+      return;
+    }
+    await new Promise<void>((resolve) => {
+      this.queue.push(resolve);
+    });
+    this.isBusy = true;
+  }
+
+  private releaseLock(): void {
+    this.isBusy = false;
+    const next = this.queue.shift();
+    if (next) {
+      next();
+    }
+  }
 
   private async getWorker() {
     if (this.worker) return this.worker;
     if (this.isInitializing) {
-      // Wait if currently initializing
       while (this.isInitializing) {
         await new Promise((r) => setTimeout(r, 100));
       }
@@ -37,7 +58,9 @@ export class TesseractOCRService implements IOCRService {
     } catch (err) {
       this.isInitializing = false;
       console.error('[OCRService] Failed to initialize Tesseract worker:', err);
-      throw err;
+      const ocrInitErr: any = new Error('Failed to initialize local OCR engine.');
+      ocrInitErr.code = 'OCR_FAILED';
+      throw ocrInitErr;
     }
   }
 
@@ -51,35 +74,66 @@ export class TesseractOCRService implements IOCRService {
   }
 
   public async recognizePage(imageBuffer: Buffer | Uint8Array): Promise<OCRResult> {
+    await this.acquireLock();
+
     try {
       const worker = await this.getWorker();
-      const result = await worker.recognize(imageBuffer);
-      const text = result.data.text || '';
-      const confidence = result.data.confidence || 0;
-      const lines = text
-        .split('\n')
-        .map((l: string) => l.trim())
-        .filter((l: string) => l.length > 0);
 
-      return {
-        text,
-        confidence,
-        lines,
-      };
+      // Bounded timeout per page
+      const timeoutMs = config.ocrTimeoutMs || 30000;
+      const recognitionPromise = (async () => {
+        const result = await worker.recognize(imageBuffer);
+        const text = result.data.text || '';
+        const confidence = result.data.confidence || 0;
+        const lines = text
+          .split('\n')
+          .map((l: string) => l.trim())
+          .filter((l: string) => l.length > 0);
+
+        return {
+          text,
+          confidence,
+          lines,
+        };
+      })();
+
+      const timeoutPromise = new Promise<OCRResult>((_, reject) => {
+        setTimeout(() => {
+          const timeoutErr: any = new Error(`OCR processing timed out after ${Math.round(timeoutMs / 1000)}s.`);
+          timeoutErr.code = 'OCR_TIMEOUT';
+          reject(timeoutErr);
+        }, timeoutMs);
+      });
+
+      return await Promise.race([recognitionPromise, timeoutPromise]);
     } catch (err: any) {
       console.error('[OCRService] OCR processing error:', err.message);
+
+      // If worker timed out or crashed, restart worker cleanly
+      if (err.code === 'OCR_TIMEOUT') {
+        await this.terminate();
+      }
+
       return {
         text: '',
         confidence: 0,
         lines: [],
       };
+    } finally {
+      this.releaseLock();
     }
   }
 
   public async terminate(): Promise<void> {
     if (this.worker) {
-      await this.worker.terminate();
-      this.worker = null;
+      try {
+        await this.worker.terminate();
+      } catch (err: any) {
+        console.error('[OCRService] Error terminating worker:', err.message);
+      } finally {
+        this.worker = null;
+        this.isInitializing = false;
+      }
     }
   }
 }
