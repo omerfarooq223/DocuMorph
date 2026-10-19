@@ -11,19 +11,38 @@ import { AIService } from './services/ai-service.js';
 import { JSONValidator } from './services/json-validator.js';
 import { SchemaValidator } from './services/schema-validator.js';
 import { ocrService } from './services/ocr-service.js';
+import { InvariantChecker } from './services/invariant-checker.js';
 import { TestPDFGenerator } from './utils/test-pdf-generator.js';
-import { ExtractionResult, ExtractionOptions } from './types.js';
+import {
+  ExtractionResult,
+  ExtractionOptions,
+  DiagnosticsData,
+  StageTimings,
+} from './types.js';
 
 const app = express();
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: {
-    fileSize: 50 * 1024 * 1024, // 50 MB limit
+    fileSize: config.maxFileSizeMb * 1024 * 1024,
+    files: 1,
   },
 });
 
 app.use(cors());
-app.use(express.json({ limit: '10mb' }));
+app.use(express.json({ limit: '20mb' }));
+
+/**
+ * Standardized API Error Response Helper
+ */
+function sendStandardError(res: express.Response, statusCode: number, code: string, message: string) {
+  return res.status(statusCode).json({
+    error: {
+      code,
+      message,
+    },
+  });
+}
 
 /**
  * Health check & runtime config
@@ -31,24 +50,54 @@ app.use(express.json({ limit: '10mb' }));
 app.get('/api/health', (req, res) => {
   res.json({
     status: 'ok',
+    version: '1.0.0-rc.1',
     defaultEngine: config.defaultEngine,
     ocrAvailable: true,
     aiProviders: ['ollama', 'gemini', 'openai'],
-    privacyNotice: '100% Local / Offline extraction by default. Zero document data is sent externally unless AI Engine is explicitly selected.',
+    privacyNotice:
+      '100% Local / Offline extraction by default. Grounded extraction — values are derived from document content.',
+    limits: {
+      maxFileSizeMb: config.maxFileSizeMb,
+      maxPdfPages: config.maxPdfPages,
+      maxOcrPages: config.maxOcrPages,
+    },
   });
 });
 
 /**
  * Get basic PDF information (fast inspection)
  */
-app.post('/api/upload-info', upload.single('file'), async (req, res) => {
+app.post('/api/upload-info', (req, res, next) => {
+  upload.single('file')(req, res, (err: any) => {
+    if (err) {
+      if (err.code === 'LIMIT_FILE_SIZE') {
+        return sendStandardError(
+          res,
+          413,
+          'PDF_TOO_LARGE',
+          `File size exceeds maximum allowed limit of ${config.maxFileSizeMb}MB.`
+        );
+      }
+      return sendStandardError(res, 400, 'INVALID_FILE_TYPE', err.message || 'File upload error.');
+    }
+    next();
+  });
+}, async (req, res) => {
   try {
     if (!req.file) {
-      return res.status(400).json({ error: 'No PDF file uploaded.' });
+      return sendStandardError(res, 400, 'INVALID_FILE_TYPE', 'No PDF file uploaded.');
     }
 
-    if (req.file.mimetype !== 'application/pdf' && !req.file.originalname.toLowerCase().endsWith('.pdf')) {
-      return res.status(400).json({ error: 'Unsupported file type. Please upload a valid PDF document.' });
+    if (
+      req.file.mimetype !== 'application/pdf' &&
+      !req.file.originalname.toLowerCase().endsWith('.pdf')
+    ) {
+      return sendStandardError(
+        res,
+        400,
+        'INVALID_PDF',
+        'Unsupported file type. Please upload a valid PDF document.'
+      );
     }
 
     const intermediateDoc = await PDFParser.parse(req.file.buffer, {
@@ -61,22 +110,38 @@ app.post('/api/upload-info', upload.single('file'), async (req, res) => {
       metadata: intermediateDoc.metadata,
     });
   } catch (err: any) {
-    console.error('[Upload-Info] Error reading PDF:', err);
-    return res.status(500).json({
-      error: `Failed to inspect PDF: ${err.message || 'Corrupted or unreadable document.'}`,
-    });
+    console.error('[Upload-Info] Error reading PDF:', err.message);
+    const code = err.code || 'INVALID_PDF';
+    const status = code === 'PDF_TOO_LARGE' ? 413 : code === 'PDF_PASSWORD_PROTECTED' ? 401 : 400;
+    return sendStandardError(res, status, code, err.message || 'Corrupted or unreadable document.');
   }
 });
 
 /**
- * Full PDF to JSON Extraction Pipeline
+ * Full PDF to JSON Extraction Pipeline with Stage-by-Stage Diagnostics & Invariant Checks
  */
-app.post('/api/extract', upload.single('file'), async (req, res) => {
-  const startTime = Date.now();
+app.post('/api/extract', (req, res, next) => {
+  upload.single('file')(req, res, (err: any) => {
+    if (err) {
+      if (err.code === 'LIMIT_FILE_SIZE') {
+        return sendStandardError(
+          res,
+          413,
+          'PDF_TOO_LARGE',
+          `File size exceeds maximum allowed limit of ${config.maxFileSizeMb}MB.`
+        );
+      }
+      return sendStandardError(res, 400, 'INVALID_FILE_TYPE', err.message || 'File upload error.');
+    }
+    next();
+  });
+}, async (req, res) => {
+  const overallStartTime = Date.now();
+  const stageTimings: StageTimings = {};
 
   try {
     if (!req.file) {
-      return res.status(400).json({ error: 'No PDF file uploaded.' });
+      return sendStandardError(res, 400, 'INVALID_FILE_TYPE', 'No PDF file uploaded.');
     }
 
     let options: ExtractionOptions = {
@@ -85,50 +150,54 @@ app.post('/api/extract', upload.single('file'), async (req, res) => {
 
     if (req.body.options) {
       try {
-        options = typeof req.body.options === 'string' ? JSON.parse(req.body.options) : req.body.options;
+        options =
+          typeof req.body.options === 'string'
+            ? JSON.parse(req.body.options)
+            : req.body.options;
       } catch {
         // Use default
       }
     }
 
-    // Step 1: Parse PDF layout and extract intermediate text blocks
+    // Stage 1 & 2: Parse PDF layout, detect scans, and apply OCR fallback
+    const t0 = Date.now();
+    const enableOcr = req.body.enableOcr !== 'false';
     const intermediateDoc = await PDFParser.parse(req.file.buffer, {
       fileName: req.file.originalname,
       fileSizeBytes: req.file.size,
+      enableOcrFallback: enableOcr,
     });
+    stageTimings.pdfParsingMs = Date.now() - t0;
+    stageTimings.ocrMs = intermediateDoc.metadata.ocrApplied ? (Date.now() - t0) : 0;
 
-    // Step 2: Scanned PDF / OCR Detection & Handling
-    let ocrApplied = false;
-    if (intermediateDoc.metadata.isScanned && req.body.enableOcr !== 'false') {
-      try {
-        // Page-by-page OCR fallback for low-text pages
-        for (const page of intermediateDoc.pages) {
-          if (page.isScanned) {
-            // Note: In Node environment, we can pass page rendering buffer or text extraction
-            // OCR service is ready to parse rasterized page data
-            ocrApplied = true;
-          }
-        }
-        intermediateDoc.metadata.ocrApplied = ocrApplied;
-      } catch (ocrErr: any) {
-        console.warn('[Extraction] OCR fallback warning:', ocrErr.message);
-      }
-    }
-
-    // Step 3: Extract Tables with coordinate layout
+    // Stage 3: Extract Tables with coordinate layout & multi-page continuation
+    const tTableStart = Date.now();
     const tables = TableExtractor.extractTables(intermediateDoc);
     intermediateDoc.tables = tables;
+    stageTimings.tableExtractionMs = Date.now() - tTableStart;
 
-    // Step 4: Extract Key-Value Pairs, Lists, and Section hierarchy
-    const { keyValuePairs, lists, sections } = KVExtractor.extract(intermediateDoc, tables);
+    // Stage 4: Extract Key-Value Pairs, Lists, and Section hierarchy
+    const tKVStart = Date.now();
+    const { keyValuePairs, lists, sections } = KVExtractor.extract(
+      intermediateDoc,
+      tables
+    );
     intermediateDoc.keyValuePairs = keyValuePairs;
     intermediateDoc.lists = lists;
     intermediateDoc.sections = sections;
+    stageTimings.kvExtractionMs = Date.now() - tKVStart;
 
-    // Step 5: Document Classification
-    const classification = DocumentClassifier.classify(intermediateDoc, tables, keyValuePairs);
+    // Stage 5: Document Classification
+    const tClassStart = Date.now();
+    const classification = DocumentClassifier.classify(
+      intermediateDoc,
+      tables,
+      keyValuePairs
+    );
+    stageTimings.classificationMs = Date.now() - tClassStart;
 
-    // Step 6: Semantic & Structural Extraction
+    // Stage 6: Semantic & Structural Extraction
+    const tSemStart = Date.now();
     let semanticJson: Record<string, any> = {};
     let structuralJson: any = {};
     let provenanceMap: Record<string, any> = {};
@@ -143,15 +212,17 @@ app.post('/api/extract', upload.single('file'), async (req, res) => {
           const validated = JSONValidator.validateAndRepair(aiResult.rawJson);
           semanticJson = validated.data as Record<string, any>;
         } else {
-          // Graceful fallback to local extraction if AI returned empty or failed
-          console.warn(`[Extraction] AI Provider ${options.aiProvider} failed (${aiResult.error}). Falling back to local engine.`);
+          console.warn(
+            `[Extraction] AI Provider ${options.aiProvider} failed (${aiResult.error}). Falling back to local engine.`
+          );
           const localResult = LocalExtractor.transform(
             intermediateDoc,
             classification.documentType,
             tables,
             keyValuePairs,
             lists,
-            sections
+            sections,
+            { includeMetadata: options.includeMetadata }
           );
           semanticJson = localResult.semanticJson;
           structuralJson = localResult.structuralJson;
@@ -162,7 +233,6 @@ app.post('/api/extract', upload.single('file'), async (req, res) => {
     }
 
     if (Object.keys(semanticJson).length === 0) {
-      // Local Engine Extraction
       if (options.customSchema) {
         const customTemplate =
           typeof options.customSchema === 'string'
@@ -182,26 +252,71 @@ app.post('/api/extract', upload.single('file'), async (req, res) => {
           tables,
           keyValuePairs,
           lists,
-          sections
+          sections,
+          { includeMetadata: options.includeMetadata }
         );
         semanticJson = localResult.semanticJson;
         structuralJson = localResult.structuralJson;
         provenanceMap = localResult.provenanceMap;
       }
     }
+    stageTimings.semanticTransformationMs = Date.now() - tSemStart;
 
-    // Step 7: Final JSON Validation & Repair
+    // Stage 7: Final JSON Validation & Repair
+    const tValStart = Date.now();
     const validationResult = JSONValidator.validateAndRepair(semanticJson);
+    stageTimings.validationMs = Date.now() - tValStart;
 
-    const executionTimeMs = Date.now() - startTime;
+    const totalExecutionTimeMs = Date.now() - overallStartTime;
+    stageTimings.totalMs = totalExecutionTimeMs;
+
+    // Stage 8: Extraction Invariants Verification
+    const invariantsCheck = InvariantChecker.verifyInvariants(
+      intermediateDoc,
+      provenanceMap,
+      validationResult.data as Record<string, any>
+    );
+
+    // Build Diagnostics Data
+    const diagnosticsData: DiagnosticsData = {
+      pages: intermediateDoc.pages.map((p) => ({
+        page: p.pageNumber,
+        dimensions: { width: p.width, height: p.height },
+        textItemCount: p.textItems.length,
+        lineCount: p.lines.length,
+        isScanned: p.isScanned,
+        ocrUsed: !!p.ocrApplied,
+        columnRegionsDetected: p.regions.length,
+        detectedHeadings: p.detectedHeadings,
+        detectedKeyValues: p.detectedKeyValues.map((kv) => ({
+          key: kv.key,
+          value: kv.value,
+          confidence: kv.confidence,
+          bbox: kv.provenance.boundingBox,
+        })),
+        detectedTables: p.detectedTables.map((t) => ({
+          tableId: t.id,
+          headers: t.headers,
+          rowCount: t.rows.length,
+          confidence: t.confidence,
+          sourcePages: t.pages,
+          bbox: t.boundingBox,
+        })),
+      })),
+      classifierScores: classification.allScores || ({} as any),
+      stageTimings,
+      invariantsCheck,
+    };
 
     const finalResponse: ExtractionResult = {
       success: true,
       documentType: classification.documentType,
       classificationConfidence: classification.confidence,
+      classifierReasons: classification.reasons,
       engineUsed,
       aiProviderUsed: engineUsed === 'ai' ? aiProviderUsed : undefined,
-      executionTimeMs,
+      executionTimeMs: totalExecutionTimeMs,
+      stageTimings,
       metadata: intermediateDoc.metadata,
       semanticJson: validationResult.data as Record<string, any>,
       structuralJson: structuralJson || {
@@ -210,6 +325,7 @@ app.post('/api/extract', upload.single('file'), async (req, res) => {
         sections: [],
       },
       provenanceMap,
+      diagnostics: diagnosticsData,
       validation: {
         isValidJson: validationResult.isValid,
         repaired: validationResult.repaired,
@@ -219,12 +335,27 @@ app.post('/api/extract', upload.single('file'), async (req, res) => {
 
     return res.json(finalResponse);
   } catch (err: any) {
-    console.error('[Extraction Pipeline] Fatal error:', err);
-    return res.status(500).json({
-      success: false,
-      error: `Extraction failed: ${err.message || 'An unexpected error occurred during processing.'}`,
-      executionTimeMs: Date.now() - startTime,
-    });
+    console.error('[Extraction Pipeline] Error:', err.message);
+    const code = err.code || 'EXTRACTION_FAILED';
+    const status =
+      code === 'PDF_TOO_LARGE'
+        ? 413
+        : code === 'PDF_PASSWORD_PROTECTED'
+        ? 401
+        : code === 'PDF_PAGE_LIMIT_EXCEEDED'
+        ? 413
+        : code === 'SCHEMA_TOO_LARGE'
+        ? 413
+        : code === 'SCHEMA_INVALID' || code === 'INVALID_PDF'
+        ? 400
+        : 500;
+
+    return sendStandardError(
+      res,
+      status,
+      code,
+      err.message || 'An unexpected error occurred during document extraction.'
+    );
   }
 });
 
@@ -260,12 +391,14 @@ app.get('/api/sample/:type', async (req, res) => {
     res.setHeader('Content-Disposition', `inline; filename="${filename}"`);
     res.send(pdfBuffer);
   } catch (err: any) {
-    res.status(500).json({ error: `Failed to generate sample PDF: ${err.message}` });
+    return sendStandardError(res, 500, 'EXTRACTION_FAILED', `Failed to generate sample PDF: ${err.message}`);
   }
 });
 
 const PORT = config.port;
 app.listen(PORT, () => {
   console.log(`[PDF to JSON Agent] Server listening on http://localhost:${PORT}`);
-  console.log(`[Privacy Mode] Default engine is set to "${config.defaultEngine}" (100% Local / Offline)`);
+  console.log(
+    `[Privacy Mode] Default engine is set to "${config.defaultEngine}" (100% Local / Grounded Extraction)`
+  );
 });

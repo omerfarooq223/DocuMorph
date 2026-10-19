@@ -7,7 +7,6 @@ import {
   DocumentType,
   Provenance,
 } from '../types.js';
-import { parseNumberSafely, normalizeDateSafely } from '../utils/normalizer.js';
 
 export class LocalExtractor {
   /**
@@ -19,7 +18,8 @@ export class LocalExtractor {
     tables: RawTable[],
     kvs: KeyValuePair[],
     lists: ListItem[],
-    sections: DocumentSection[]
+    sections: DocumentSection[],
+    options: { includeMetadata?: boolean } = {}
   ): {
     semanticJson: Record<string, any>;
     structuralJson: any;
@@ -36,8 +36,11 @@ export class LocalExtractor {
         page: sec.page,
         content: sec.content,
         tables: sec.tables.map((t) => ({
+          id: t.id,
           headers: t.headers,
           rows: t.structuredRows || t.rows,
+          confidence: t.confidence,
+          sourcePages: t.pages,
         })),
         lists: sec.lists.map((l) => l.text),
         key_values: Object.fromEntries(sec.keyValuePairs.map((kv) => [kv.key, kv.value])),
@@ -63,6 +66,14 @@ export class LocalExtractor {
       default:
         semanticJson = this.buildGenericSemantic(doc, tables, kvs, lists, sections, provenanceMap);
         break;
+    }
+
+    // If includeMetadata is enabled, embed provenance map under _metadata key
+    if (options.includeMetadata) {
+      semanticJson._extraction_metadata = {
+        provenance: provenanceMap,
+        document_metadata: doc.metadata,
+      };
     }
 
     return {
@@ -113,16 +124,21 @@ export class LocalExtractor {
 
     // Find items table
     let items: any[] = [];
-    const itemTable = tables.find((t) =>
-      t.headers.some((h) => ['description', 'item', 'details', 'particulars'].includes(h))
-    ) || tables[0];
+    const itemTable =
+      tables.find((t) =>
+        t.headers.some((h) => ['description', 'item', 'details', 'particulars'].includes(h))
+      ) || tables[0];
 
     if (itemTable && itemTable.structuredRows) {
       items = itemTable.structuredRows;
       itemTable.structuredRows.forEach((_, idx) => {
+        const rowProv = itemTable.rowProvenance?.[idx];
         provenanceMap[`items[${idx}]`] = {
-          page: itemTable.page,
+          page: rowProv?.sourcePage || itemTable.page,
           sourceText: `Table row ${idx + 1}`,
+          sourceValue: JSON.stringify(itemTable.structuredRows?.[idx] || {}),
+          confidence: itemTable.confidence,
+          sourceMethod: 'pdf_text',
           boundingBox: itemTable.boundingBox,
         };
       });
@@ -177,16 +193,21 @@ export class LocalExtractor {
     if (closeBal) provenanceMap['closing_balance'] = closeBal.provenance;
 
     let transactions: any[] = [];
-    const txnTable = tables.find((t) =>
-      t.headers.some((h) => ['balance', 'debit', 'credit', 'amount', 'transaction'].includes(h))
-    ) || tables[0];
+    const txnTable =
+      tables.find((t) =>
+        t.headers.some((h) => ['balance', 'debit', 'credit', 'amount', 'transaction'].includes(h))
+      ) || tables[0];
 
     if (txnTable && txnTable.structuredRows) {
       transactions = txnTable.structuredRows;
       txnTable.structuredRows.forEach((_, idx) => {
+        const rowProv = txnTable.rowProvenance?.[idx];
         provenanceMap[`transactions[${idx}]`] = {
-          page: txnTable.page,
+          page: rowProv?.sourcePage || txnTable.page,
           sourceText: `Transaction row ${idx + 1}`,
+          sourceValue: JSON.stringify(txnTable.structuredRows?.[idx] || {}),
+          confidence: txnTable.confidence,
+          sourceMethod: 'pdf_text',
           boundingBox: txnTable.boundingBox,
         };
       });
@@ -215,8 +236,7 @@ export class LocalExtractor {
     provenanceMap: Record<string, Provenance>
   ): Record<string, any> {
     const rawText = doc.rawText;
-    
-    // Extract Email & Phone
+
     const emailMatch = rawText.match(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/);
     const phoneMatch = rawText.match(/(?:\+?\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}/);
     const firstLine = doc.pages[0]?.lines[0]?.text || null;
@@ -226,6 +246,26 @@ export class LocalExtractor {
       email: emailMatch ? emailMatch[0] : null,
       phone: phoneMatch ? phoneMatch[0] : null,
     };
+
+    if (emailMatch) {
+      const emailLine = doc.pages.flatMap((p) => p.lines).find((l) => l.text.includes(emailMatch[0]));
+      provenanceMap['email'] = {
+        page: emailLine?.page || 1,
+        sourceText: emailLine?.text || emailMatch[0],
+        sourceValue: emailMatch[0],
+        confidence: 'high',
+        sourceMethod: emailLine?.sourceMethod || 'pdf_text',
+        coordinateSpace: emailLine?.sourceMethod === 'ocr' ? 'ocr_image' : 'idr_top_left',
+        boundingBox: emailLine
+          ? {
+              x: emailLine.minX,
+              y: emailLine.y,
+              width: emailLine.maxX - emailLine.minX,
+              height: emailLine.height,
+            }
+          : undefined,
+      };
+    }
 
     const sectionEntries: Record<string, any> = {};
     for (const sec of sections) {
@@ -264,6 +304,9 @@ export class LocalExtractor {
     const date = kvMap['date'] || kvMap['time'] || null;
     const merchant = doc.pages[0]?.lines[0]?.text || null;
 
+    if (total) provenanceMap['total'] = total.provenance;
+    if (date) provenanceMap['date'] = date.provenance;
+
     return {
       document_type: 'receipt',
       merchant,
@@ -284,7 +327,6 @@ export class LocalExtractor {
     sections: DocumentSection[],
     provenanceMap: Record<string, Provenance>
   ): Record<string, any> {
-    // If key-values exist, convert to structured map
     const kvMap: Record<string, any> = {};
     kvs.forEach((kv) => {
       kvMap[kv.key] = kv.value;
@@ -293,7 +335,9 @@ export class LocalExtractor {
 
     return {
       document: {
-        title: doc.metadata.title || (doc.pages[0]?.lines[0]?.text ? doc.pages[0].lines[0].text : null),
+        title:
+          doc.metadata.title ||
+          (doc.pages[0]?.lines[0]?.text ? doc.pages[0].lines[0].text : null),
         document_type: 'generic',
         metadata: {
           file_name: doc.metadata.fileName,
